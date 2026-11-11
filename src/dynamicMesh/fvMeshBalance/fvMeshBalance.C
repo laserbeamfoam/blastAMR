@@ -235,11 +235,25 @@ void Foam::fvMeshBalance::read(const dictionary& balanceDict)
     // 2. The dict explicitly specifies a loadPolicy type
     // This prevents overwriting a configured loadPolicy with the default
     // when re-reading from a dict that doesn't have loadPolicy entry
-    if (!loadPolicy_ || balanceDict.found("loadPolicy"))
+    // (Re)create the policy only when there is none, when balancing is
+    // switched off, or when the dictionary asks for a different type.
+    // Re-creating it on every read would reset the state it accumulates:
+    // the cpuLoad constructor resets the MPI timing statistics, so
+    // canBalance() would measure the load over the microseconds since
+    // ("Compute load 0 ms" on every rank) and the decomposer would get
+    // noise as cell weights.
+    const bool wantPolicy = balanceDict.lookupOrDefault("balance", true);
+    const word wantType
+    (
+        balanceDict.lookupOrDefault<word>("loadPolicy", "cellCount")
+    );
+    if (!wantPolicy)
     {
-        loadPolicy_ = balanceDict.lookupOrDefault("balance", true)
-            ? loadPolicy::New(mesh_, balanceDict)
-            : nullptr;
+        loadPolicy_ = nullptr;
+    }
+    else if (!loadPolicy_ || loadPolicy_->type() != wantType)
+    {
+        loadPolicy_ = loadPolicy::New(mesh_, balanceDict);
     }
 
     // Read sampledSurface expiration setting (opt-in, allows runtime changes)
@@ -490,6 +504,50 @@ bool Foam::fvMeshBalance::canBalance() const
     );
 
     // Check if distribution will improve anything
+    // Refuse a redistribution that would leave a rank without cells or
+    // without internal faces. The Courant headers of the OpenFOAM solvers
+    // skip their global reductions on such a rank
+    // (if (mesh.nInternalFaces()) { ... gMax ... }) and every other rank
+    // deadlocks in that reduction.
+    // Counted on the current decomposition: cells per target rank are
+    // exact, internal faces per target rank are a lower bound (a face on a
+    // processor patch now may become internal there).
+    {
+        const label nProcs = Pstream::nProcs();
+        labelList nCellsTo(nProcs, Zero);
+        labelList nIntFacesTo(nProcs, Zero);
+        forAll(distribution_, celli)
+        {
+            nCellsTo[distribution_[celli]]++;
+        }
+        const labelUList& own = mesh_.faceOwner();
+        const labelUList& nei = mesh_.faceNeighbour();
+        for (label facei = 0; facei < mesh_.nInternalFaces(); ++facei)
+        {
+            const label p = distribution_[own[facei]];
+            if (p == distribution_[nei[facei]])
+            {
+                nIntFacesTo[p]++;
+            }
+        }
+        Pstream::listCombineReduce(nCellsTo, plusEqOp<label>());
+        Pstream::listCombineReduce(nIntFacesTo, plusEqOp<label>());
+
+        const label badProc =
+            (min(nCellsTo) == 0) ? nCellsTo.find(0) : nIntFacesTo.find(0);
+        if (badProc >= 0)
+        {
+            WarningInFunction
+                << "Load balancing skipped at time index "
+                << mesh_.time().timeIndex() << ": the new decomposition"
+                << " would leave rank " << badProc << " with "
+                << nCellsTo[badProc] << " cells and " << nIntFacesTo[badProc]
+                << " internal faces (cells per rank " << nCellsTo << ")"
+                << endl;
+            return false;
+        }
+    }
+
     return loadPolicy_->willBeBeneficial(distribution_);
 
     //labelList procLoadNew(Pstream::nProcs(), 0);
