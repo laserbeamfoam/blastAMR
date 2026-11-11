@@ -179,7 +179,11 @@ void Foam::adaptiveFvMesh::mapFields(const mapPolyMesh& mpm)
 
 bool Foam::adaptiveFvMesh::firstUpdate()
 {
-    if (currentTimeIndex_ >= time().timeIndex())
+    // One update per time index: refuse a repeat at the SAME index only. A
+    // solver that runs start-up refinement passes at advanced time indices
+    // and then rewinds the time was otherwise refused every update (load
+    // balancing included) until the time index caught up again.
+    if (currentTimeIndex_ == time().timeIndex())
     {
         return false;
     }
@@ -239,7 +243,28 @@ bool Foam::adaptiveFvMesh::writeObject
     const bool valid
 ) const
 {
-    return dynamicFvMesh::writeObject(streamOpt, valid);
+    bool writeOk = dynamicFvMesh::writeObject(streamOpt, valid);
+
+    // The refiner's own data goes with the mesh: for the hex refiner this is
+    // the refinementHistory (cellLevel/pointLevel are registered AUTO_WRITE
+    // objects and need no help). Without it a restart has only cellLevel to
+    // reconstruct the history from, and the reconstruction knows one level of
+    // siblings: every cell can then unrefine exactly once below the level it
+    // was read at.
+    if (amrCore_.amrInitialized())
+    {
+        writeOk =
+            amrCore_.refiner().writeObject
+            (
+                streamOpt.format(),
+                streamOpt.version(),
+                streamOpt.compression(),
+                valid
+            )
+         && writeOk;
+    }
+
+    return writeOk;
 }
 
 
