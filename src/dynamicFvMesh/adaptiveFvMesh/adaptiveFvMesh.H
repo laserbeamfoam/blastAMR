@@ -81,8 +81,7 @@ Description
 #define adaptiveFvMesh_H
 
 #include "dynamicFvMesh.H"
-#include "errorEstimator.H"
-#include "fvMeshRefiner.H"
+#include "amrCore.H"
 
 // * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * //
 
@@ -105,15 +104,10 @@ class adaptiveFvMesh
 
 protected:
 
-        autoPtr<errorEstimator> error_;
+        //- Core AMR/LB functionality (shared with functionObject approach)
+        amrCore amrCore_;
 
-        //- Mesh cutting engine
-        autoPtr<fvMeshRefiner> refiner_;
-
-        //- Fluxes to map
-        HashTable<word> correctFluxes_;
-
-        //- Do mesh updates onlyonce per timestep
+        //- Do mesh updates only once per timestep
         label currentTimeIndex_;
 
         // Protected member functions
@@ -126,12 +120,6 @@ protected:
 
             //- Distribute additional information
             virtual void distribute(const mapDistributePolyMesh& map);
-
-            //- Map non-flux surface<Type>Fields for new internal faces
-            //  (from cell splitting)
-            template <class T>
-            void mapNewInternalFaces(const labelList& faceMap)
-            {}
 
             bool firstUpdate();
 
@@ -168,7 +156,7 @@ public:
         //- Direct access to the refinement engine
         const fvMeshRefiner& refiner() const
         {
-            return refiner_();
+            return amrCore_.refiner();
         }
 
         //- Update the mesh for both mesh motion and topology change

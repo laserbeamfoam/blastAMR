@@ -14,7 +14,7 @@ if [[ $foamv =~ ^v([0-9]{4})$ ]]; then
         echo "OpenFOAM-v${ver} detected, this version is not supported."
         exit 1
     else if [ "${ver}" -gt "2106" ]; then
-        echo "OpenFOAM-v${ver} detected, checking out the master branch (Take care that this is successful)"
+        echo "OpenFOAM-v${ver} detected, checking out the v2212 branch (Take care that this is successful)"
         git checkout v2212
     else
         echo "OpenFOAM-v${ver} detected, checking out the master branch (Take care that this is successful)"
@@ -29,9 +29,27 @@ fi
 
 #------------------------------------------------------------------------------
 
+# wmake's platform directory does not encode the OpenFOAM version, so objects
+# built against another version survive a version switch and fail to link with
+# symbols whose linkage changed in between (eg. HashTableCore::maxTableSize,
+# exported up to v2312, inline since v2412). Drop them when the version
+# changes. A missing stamp means "unknown", and is only recorded, never acted
+# on, so an existing build tree is left alone.
+stamp=platforms/.foamVersion
+prev=$(cat "$stamp" 2>/dev/null || true)
+if [ -n "$prev" ] && [ "$prev" != "$foamv" ]; then
+    echo "OpenFOAM version changed ($prev -> $foamv), cleaning stale objects"
+    ./Allwclean
+fi
+mkdir -p platforms && echo "$foamv" > "$stamp"
+
+wmake src/lagrangian
+wmake src/loadPolicies
+wmake src/cpuLoad
 wmake src/errorEstimators
 wmake src/dynamicMesh
 wmake src/dynamicFvMesh
+wmake src/functionObjects
 
 wmake applications/utilities/updateMesh
 wmake applications/solvers/combustion/reactingDyMFoam
