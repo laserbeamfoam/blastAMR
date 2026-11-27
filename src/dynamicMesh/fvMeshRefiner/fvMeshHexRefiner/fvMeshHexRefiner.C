@@ -30,6 +30,8 @@ License
 
 #include "fvMeshHexRefiner.H"
 #include "addToRunTimeSelectionTable.H"
+#include "clearCodedRedirects.H"
+#include "dynMeshTools.H"
 #include "surfaceInterpolate.H"
 #include "volFields.H"
 #include "polyTopoChange.H"
@@ -42,7 +44,6 @@ License
 #include "cellSet.H"
 #include "wedgePolyPatch.H"
 #include "hexRef3D.H"
-//#include "parcelCloud.H"
 #include "hexRefRefinementHistoryConstraint.H"
 
 // * * * * * * * * * * * * * * Static Data Members * * * * * * * * * * * * * //
@@ -96,15 +97,12 @@ void Foam::fvMeshHexRefiner::calculateProtectedCells
         forAll(mesh_.faceNeighbour(), facei)
         {
             label own = mesh_.faceOwner()[facei];
-            bool ownProtected = unrefineableCell.get(own);
             label nei = mesh_.faceNeighbour()[facei];
-            bool neiProtected = unrefineableCell.get(nei);
-
-            if (ownProtected && (cellLevel[nei] > cellLevel[own]))
+            if (unrefineableCell[own] && (cellLevel[nei] > cellLevel[own]))
             {
                 seedFace[facei] = true;
             }
-            else if (neiProtected && (cellLevel[own] > cellLevel[nei]))
+            else if (unrefineableCell[nei] && (cellLevel[own] > cellLevel[nei]))
             {
                 seedFace[facei] = true;
             }
@@ -117,10 +115,9 @@ void Foam::fvMeshHexRefiner::calculateProtectedCells
         )
         {
             label own = mesh_.faceOwner()[facei];
-            bool ownProtected = unrefineableCell.get(own);
             if
             (
-                ownProtected
+                unrefineableCell[own]
              && (neiLevel[facei-mesh_.nInternalFaces()] > cellLevel[own])
             )
             {
@@ -139,14 +136,14 @@ void Foam::fvMeshHexRefiner::calculateProtectedCells
             if (seedFace[facei])
             {
                 label own = mesh_.faceOwner()[facei];
-                if (unrefineableCell.get(own) == 0)
+                if (unrefineableCell[own] == 0)
                 {
                     unrefineableCell.set(own, 1);
                     hasExtended = true;
                 }
 
                 label nei = mesh_.faceNeighbour()[facei];
-                if (unrefineableCell.get(nei) == 0)
+                if (unrefineableCell[nei] == 0)
                 {
                     unrefineableCell.set(nei, 1);
                     hasExtended = true;
@@ -163,7 +160,7 @@ void Foam::fvMeshHexRefiner::calculateProtectedCells
             if (seedFace[facei])
             {
                 label own = mesh_.faceOwner()[facei];
-                if (unrefineableCell.get(own) == 0)
+                if (unrefineableCell[own] == 0)
                 {
                     unrefineableCell.set(own, 1);
                     hasExtended = true;
@@ -191,6 +188,11 @@ Foam::fvMeshHexRefiner::refine
 
     // Play refinement commands into mesh changer.
     meshCutter_->setRefinement(cellsToRefine, meshMod);
+
+    // Clear moving flag. This is required since geometry calculation
+    // might get triggered when doing processor patches.
+    // (same as dynamicRefineFvMesh::refine)
+    mesh_.moving(false);
 
     // Create mesh (with inflation), return map from old to new mesh.
     //autoPtr<mapPolyMesh> map = meshMod.changeMesh(mesh_, true);
@@ -224,19 +226,62 @@ Foam::fvMeshHexRefiner::refine
     //    cellTreePtr_.clear();
 
     // Update fields
+    // Note: mesh_.updateMesh(map) internally calls mapClouds() which handles
+    // cloud remapping. We do NOT call fvMeshRefiner::updateMesh here as that
+    // would result in double cloud remapping.
     mesh_.updateMesh(map);
+
+    // Reset stale codedFixedValue/codedMixed redirects after autoMap.
+    // See clearCodedRedirects.H for rationale.
+    clearCodedRedirectsAllVol(mesh_);
+
+    // Motion solvers cache zone point labels; rebuild them if the change
+    // renumbered points (unrefinement does, refinement only appends)
+    meshTools::reinitMotionSolvers(mesh_, map());
 
     // Update numbering of protectedCell_
     if (protectedCell_.size())
     {
-        boolList newProtectedCell(mesh_.nCells());
+        boolList newProtectedCell(mesh_.nCells(), false);
 
         forAll(newProtectedCell, celli)
         {
             label oldCelli = map().cellMap()[celli];
-            newProtectedCell.set(celli, protectedCell_.get(oldCelli));
+            newProtectedCell.set(celli, protectedCell_[oldCelli]);
         }
         protectedCell_.transfer(newProtectedCell);
+    }
+
+    // Update baseCellLevel_ mapping: children inherit parent's base level
+    if (baseCellLevel_.size())
+    {
+        labelList newBaseCellLevel(mesh_.nCells(), 0);
+
+        forAll(newBaseCellLevel, celli)
+        {
+            label oldCelli = map().cellMap()[celli];
+            if (oldCelli >= 0)
+            {
+                newBaseCellLevel[celli] = baseCellLevel_[oldCelli];
+            }
+        }
+        baseCellLevel_.transfer(newBaseCellLevel);
+    }
+
+    // Update basePointLevel_ mapping: new points inherit parent's base level
+    if (basePointLevel_.size())
+    {
+        labelList newBasePointLevel(mesh_.nPoints(), 0);
+
+        forAll(newBasePointLevel, pointi)
+        {
+            label oldPointi = map().pointMap()[pointi];
+            if (oldPointi >= 0 && oldPointi < basePointLevel_.size())
+            {
+                newBasePointLevel[pointi] = basePointLevel_[oldPointi];
+            }
+        }
+        basePointLevel_.transfer(newBasePointLevel);
     }
 
     // Debug: Check refinement levels (across faces only)
@@ -258,15 +303,13 @@ Foam::fvMeshHexRefiner::unrefine
     meshCutter_->setUnrefinement(splitElems, meshMod);
 
 
-    // Save information on faces that will be combined
-    // ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    // Note: no need for the upstream faceToSplitPoint bookkeeping here;
+    // amrCore::correctFluxes detects merged faces from the mapPolyMesh.
 
-    // Find the faceMidPoints on cells to be combined.
-    // for each face resulting of split of face into four store the
-    // midpoint
-    Map<label> faceToSplitPoint(0);
-    meshCutter_->calcFaceToSplitPoint(splitElems, faceToSplitPoint);
-
+    // Clear moving flag. This is required since geometry calculation
+    // might get triggered when doing processor patches.
+    // (same as dynamicRefineFvMesh::unrefine)
+    mesh_.moving(false);
 
     // Change mesh and generate map.
     //autoPtr<mapPolyMesh> map = meshMod.changeMesh(mesh_, true);
@@ -278,22 +321,65 @@ Foam::fvMeshHexRefiner::unrefine
         << endl;
 
     // Update fields
+    // Note: mesh_.updateMesh(map) internally calls mapClouds() which handles
+    // cloud remapping. We do NOT call fvMeshRefiner::updateMesh here as that
+    // would result in double cloud remapping.
     mesh_.updateMesh(map);
+
+    // Reset stale codedFixedValue/codedMixed redirects after autoMap.
+    // See clearCodedRedirects.H for rationale.
+    clearCodedRedirectsAllVol(mesh_);
+
+    // Motion solvers cache zone point labels; rebuild them if the change
+    // renumbered points (unrefinement does, refinement only appends)
+    meshTools::reinitMotionSolvers(mesh_, map());
 
     // Update numbering of protectedCell_
     if (protectedCell_.size())
     {
-        boolList newProtectedCell(mesh_.nCells());
+        boolList newProtectedCell(mesh_.nCells(), false);
 
         forAll(newProtectedCell, celli)
         {
             label oldCelli = map().cellMap()[celli];
             if (oldCelli >= 0)
             {
-                newProtectedCell.set(celli, protectedCell_.get(oldCelli));
+                newProtectedCell.set(celli, protectedCell_[oldCelli]);
             }
         }
         protectedCell_.transfer(newProtectedCell);
+    }
+
+    // Update baseCellLevel_ mapping after unrefinement
+    if (baseCellLevel_.size())
+    {
+        labelList newBaseCellLevel(mesh_.nCells(), 0);
+
+        forAll(newBaseCellLevel, celli)
+        {
+            label oldCelli = map().cellMap()[celli];
+            if (oldCelli >= 0)
+            {
+                newBaseCellLevel[celli] = baseCellLevel_[oldCelli];
+            }
+        }
+        baseCellLevel_.transfer(newBaseCellLevel);
+    }
+
+    // Update basePointLevel_ mapping: new points inherit parent's base level
+    if (basePointLevel_.size())
+    {
+        labelList newBasePointLevel(mesh_.nPoints(), 0);
+
+        forAll(newBasePointLevel, pointi)
+        {
+            label oldPointi = map().pointMap()[pointi];
+            if (oldPointi >= 0 && oldPointi < basePointLevel_.size())
+            {
+                newBasePointLevel[pointi] = basePointLevel_[oldPointi];
+            }
+        }
+        basePointLevel_.transfer(newBasePointLevel);
     }
 
     // Debug: Check refinement levels (across faces only)
@@ -332,10 +418,10 @@ Foam::labelList Foam::fvMeshHexRefiner::selectRefineCells
             if
             (
                 cellLevel[celli] < maxRefinement[celli]
-             && candidateCell.get(celli)
+             && candidateCell[celli]
              && (
                     unrefineableCell.empty()
-                 || !unrefineableCell.get(celli)
+                 || !unrefineableCell[celli]
                 )
             )
             {
@@ -355,10 +441,10 @@ Foam::labelList Foam::fvMeshHexRefiner::selectRefineCells
                 if
                 (
                     cellLevel[celli] == level
-                 && candidateCell.get(celli)
+                 && candidateCell[celli]
                  && (
                         unrefineableCell.empty()
-                     || !unrefineableCell.get(celli)
+                     || !unrefineableCell[celli]
                     )
                 )
                 {
@@ -421,7 +507,7 @@ void Foam::fvMeshHexRefiner::checkEightAnchorPoints
                     }
                 }
 
-                if (!protectedCell.get(celli))
+                if (!protectedCell[celli])
                 {
                     nAnchorPoints[celli]++;
                 }
@@ -432,7 +518,7 @@ void Foam::fvMeshHexRefiner::checkEightAnchorPoints
 
     forAll(protectedCell, celli)
     {
-        if (!protectedCell.get(celli) && nAnchorPoints[celli] != 8)
+        if (!protectedCell[celli] && nAnchorPoints[celli] != 8)
         {
             protectedCell.set(celli, true);
             nProtected++;
@@ -554,7 +640,7 @@ void Foam::fvMeshHexRefiner::distribute
         boolList protectedCell(protectedCell_.size(), false);
         forAll(protectedCell, i)
         {
-            if (protectedCell_.get(i))
+            if (protectedCell_[i])
             {
                 protectedCell[i] = true;
             }
@@ -567,6 +653,17 @@ void Foam::fvMeshHexRefiner::distribute
         }
     }
 
+    // Distribute baseCellLevel_ across processors
+    if (baseCellLevel_.size())
+    {
+        map.distributeCellData(baseCellLevel_);
+    }
+
+    // Distribute basePointLevel_ across processors
+    if (basePointLevel_.size())
+    {
+        map.distributePointData(basePointLevel_);
+    }
 }
 
 // * * * * * * * * * * * * * * * * Constructors  * * * * * * * * * * * * * * //
@@ -578,7 +675,34 @@ Foam::fvMeshHexRefiner::fvMeshHexRefiner(fvMesh& mesh)
     meshCutter_(hexRef::New(mesh_)),
 
     nProtected_(0.0),
-    protectedCell_(mesh_.nCells(), false)
+    protectedCell_(mesh_.nCells(), false),
+
+    baseCellLevel_
+    (
+        IOobject
+        (
+            "baseCellLevel",
+            mesh_.facesInstance(),
+            polyMesh::meshSubDir,
+            mesh_,
+            IOobject::READ_IF_PRESENT,
+            IOobject::AUTO_WRITE
+        ),
+        labelList(mesh_.nCells(), 0)
+    ),
+    basePointLevel_
+    (
+        IOobject
+        (
+            "basePointLevel",
+            mesh_.facesInstance(),
+            polyMesh::meshSubDir,
+            mesh_,
+            IOobject::READ_IF_PRESENT,
+            IOobject::AUTO_WRITE
+        ),
+        labelList(mesh_.nPoints(), 0)
+    )
 {
     // Added refinement history decomposition constraint to keep all
     // cells with the same parent together
@@ -589,14 +713,14 @@ Foam::fvMeshHexRefiner::fvMeshHexRefiner(fvMesh& mesh)
             "type",
             hexRefRefinementHistoryConstraint::typeName
         );
-        //balancer_.addConstraint("refinementHistory", refinementHistoryDict);
+        balancer_.addConstraint("refinementHistory", refinementHistoryDict);
     }
 
     nProtected_ = 0;
 
     forAll(protectedCell_, celli)
     {
-        if (protectedCell_.get(celli))
+        if (protectedCell_[celli])
         {
             nProtected_++;
         }
@@ -624,7 +748,7 @@ Foam::fvMeshHexRefiner::fvMeshHexRefiner(fvMesh& mesh)
         {
             label celli = pCells[i];
 
-            if (!protectedCell_.get(celli))
+            if (!protectedCell_[celli])
             {
                 if (pointLevel[pointi] <= cellLevel[celli])
                 {
@@ -794,7 +918,7 @@ Foam::fvMeshHexRefiner::fvMeshHexRefiner(fvMesh& mesh)
                             }
                         }
                     }
-                    if (!protectedCell_.get(celli))
+                    if (!protectedCell_[celli])
                     {
                         cellIsAxisPrism.set(celli, 1);
                         nAxisPrims++;
@@ -834,9 +958,9 @@ Foam::fvMeshHexRefiner::fvMeshHexRefiner(fvMesh& mesh)
             {
                 if (visibleCells[celli] >= 0)
                 {
-                    if (protectedCell_.get(celli))
+                    if (protectedCell_[celli])
                     {
-                        protectedCell_.unset(celli);
+                        protectedCell_.set(celli, false);
                         nProtected_--;
                     }
                 }
@@ -938,7 +1062,7 @@ Foam::fvMeshHexRefiner::fvMeshHexRefiner(fvMesh& mesh)
 
                 forAll(protectedCell_, celli)
                 {
-                    if (protectedCell_.get(celli))
+                    if (protectedCell_[celli])
                     {
                         // Check if the cell has exactly 2 points on the axis
                         label numPointsOnAxis = 0;
@@ -983,7 +1107,7 @@ Foam::fvMeshHexRefiner::fvMeshHexRefiner(fvMesh& mesh)
                              == numNeighboursWithHigherLevel
                             )
                             {
-                                protectedCell_.unset(celli);
+                                protectedCell_.set(celli, false);
                                 nProtected_--;
                             }
                         }
@@ -999,7 +1123,7 @@ Foam::fvMeshHexRefiner::fvMeshHexRefiner(fvMesh& mesh)
         cellSet protectedCells(mesh_, "protectedCells", nProtected_);
         forAll(protectedCell_, celli)
         {
-            if (protectedCell_.get(celli))
+            if (protectedCell_[celli])
             {
                 protectedCells.insert(celli);
             }
@@ -1008,6 +1132,11 @@ Foam::fvMeshHexRefiner::fvMeshHexRefiner(fvMesh& mesh)
         Info<< "Detected " << returnReduce(nProtected_, sumOp<label>())
             << " cells that are protected from refinement." << endl;
     }
+
+    Info<< "Base cell levels for unrefinement floor."
+        << " Min: " << gMin(baseCellLevel_)
+        << " Max: " << gMax(baseCellLevel_)
+        << endl;
 }
 
 
@@ -1029,7 +1158,34 @@ Foam::fvMeshHexRefiner::fvMeshHexRefiner
     ),
 
     nProtected_(0),
-    protectedCell_(mesh_.nCells(), false)
+    protectedCell_(mesh_.nCells(), false),
+
+    baseCellLevel_
+    (
+        IOobject
+        (
+            "baseCellLevel",
+            mesh_.facesInstance(),
+            polyMesh::meshSubDir,
+            mesh_,
+            IOobject::READ_IF_PRESENT,
+            IOobject::AUTO_WRITE
+        ),
+        labelList(mesh_.nCells(), 0)
+    ),
+    basePointLevel_
+    (
+        IOobject
+        (
+            "basePointLevel",
+            mesh_.facesInstance(),
+            polyMesh::meshSubDir,
+            mesh_,
+            IOobject::READ_IF_PRESENT,
+            IOobject::AUTO_WRITE
+        ),
+        labelList(mesh_.nPoints(), 0)
+    )
 {
     // Added refinement history decomposition constraint to keep all
     // cells with the same parent together
@@ -1040,7 +1196,7 @@ Foam::fvMeshHexRefiner::fvMeshHexRefiner
             "type",
             hexRefRefinementHistoryConstraint::typeName
         );
-        //balancer_.addConstraint("refinementHistory", refinementHistoryDict);
+        balancer_.addConstraint("refinementHistory", refinementHistoryDict);
     }
 
     // Read static part of dictionary
@@ -1050,7 +1206,7 @@ Foam::fvMeshHexRefiner::fvMeshHexRefiner
 
     forAll(protectedCell_, celli)
     {
-        if (protectedCell_.get(celli))
+        if (protectedCell_[celli])
         {
             nProtected_++;
         }
@@ -1078,7 +1234,7 @@ Foam::fvMeshHexRefiner::fvMeshHexRefiner
         {
             label celli = pCells[i];
 
-            if (!protectedCell_.get(celli))
+            if (!protectedCell_[celli])
             {
                 if (pointLevel[pointi] <= cellLevel[celli])
                 {
@@ -1248,7 +1404,7 @@ Foam::fvMeshHexRefiner::fvMeshHexRefiner
                             }
                         }
                     }
-                    if (!protectedCell_.get(celli))
+                    if (!protectedCell_[celli])
                     {
                         cellIsAxisPrism.set(celli, 1);
                         nAxisPrims++;
@@ -1288,9 +1444,9 @@ Foam::fvMeshHexRefiner::fvMeshHexRefiner
             {
                 if (visibleCells[celli] >= 0)
                 {
-                    if (protectedCell_.get(celli))
+                    if (protectedCell_[celli])
                     {
-                        protectedCell_.unset(celli);
+                        protectedCell_.set(celli, false);
                         nProtected_--;
                     }
                 }
@@ -1392,7 +1548,7 @@ Foam::fvMeshHexRefiner::fvMeshHexRefiner
 
                 forAll(protectedCell_, celli)
                 {
-                    if (protectedCell_.get(celli))
+                    if (protectedCell_[celli])
                     {
                         // Check if the cell has exactly 2 points on the axis
                         label numPointsOnAxis = 0;
@@ -1437,7 +1593,7 @@ Foam::fvMeshHexRefiner::fvMeshHexRefiner
                              == numNeighboursWithHigherLevel
                             )
                             {
-                                protectedCell_.unset(celli);
+                                protectedCell_.set(celli, false);
                                 nProtected_--;
                             }
                         }
@@ -1453,7 +1609,7 @@ Foam::fvMeshHexRefiner::fvMeshHexRefiner
         cellSet protectedCells(mesh_, "protectedCells", nProtected_);
         forAll(protectedCell_, celli)
         {
-            if (protectedCell_.get(celli))
+            if (protectedCell_[celli])
             {
                 protectedCells.insert(celli);
             }
@@ -1462,6 +1618,11 @@ Foam::fvMeshHexRefiner::fvMeshHexRefiner
         Info<< "Detected " << returnReduce(nProtected_, sumOp<label>())
             << " cells that are protected from refinement." << endl;
     }
+
+    Info<< "Base cell levels for unrefinement floor."
+        << " Min: " << gMin(baseCellLevel_)
+        << " Max: " << gMax(baseCellLevel_)
+        << endl;
 }
 
 
@@ -1488,7 +1649,7 @@ bool Foam::fvMeshHexRefiner::refine
     if (preUpdate())
     {
         // Cells marked for refinement or otherwise protected from unrefinement.
-        boolList refineCell(mesh_.nCells());
+        boolList refineCell(mesh_.nCells(), false);
 
         if (canRefine(true))
         {
@@ -1525,7 +1686,7 @@ bool Foam::fvMeshHexRefiner::refine
             {
                 forAll(protectedCell_, celli)
                 {
-                    if (protectedCell_.get(celli))
+                    if (protectedCell_[celli])
                     {
                         refineCell.set(celli, false);
                     }
@@ -1563,7 +1724,7 @@ bool Foam::fvMeshHexRefiner::refine
                     const labelList& cellMap = map().cellMap();
                     const labelList& reverseCellMap = map().reverseCellMap();
 
-                    boolList newRefineCell(cellMap.size());
+                    boolList newRefineCell(cellMap.size(), false);
 
                     forAll(cellMap, celli)
                     {
@@ -1579,7 +1740,7 @@ bool Foam::fvMeshHexRefiner::refine
                         }
                         else
                         {
-                            newRefineCell.set(celli, refineCell.get(oldCelli));
+                            newRefineCell.set(celli, refineCell[oldCelli]);
                         }
                     }
                     refineCell.transfer(newRefineCell);
@@ -1604,7 +1765,7 @@ bool Foam::fvMeshHexRefiner::refine
             {
                 forAll(protectedCell_, celli)
                 {
-                    if (protectedCell_.get(celli))
+                    if (protectedCell_[celli])
                     {
                         refineCell.set(celli, true);
                     }
@@ -1619,6 +1780,18 @@ bool Foam::fvMeshHexRefiner::refine
                 {
                     label own = mesh_.faceOwner()[facei + p.start()];
                     refineCell.set(own, true);
+                }
+            }
+
+            // Prevent unrefinement below initial mesh (e.g. SHM) level
+            {
+                const labelList& curLevel = meshCutter_->cellLevel();
+                forAll(curLevel, celli)
+                {
+                    if (curLevel[celli] <= baseCellLevel_[celli])
+                    {
+                        refineCell.set(celli, true);
+                    }
                 }
             }
 
@@ -1662,11 +1835,8 @@ bool Foam::fvMeshHexRefiner::refine
         }
 
         reduce(hasChanged, orOp<bool>());
-        if (balance())
-        {
-            hasChanged = true;
-        }
-
+        // Note: balance() is now called independently in adaptiveFvMesh::update()
+        // to allow balanceInterval to differ from refineInterval
         mesh_.topoChanging(hasChanged);
         if (hasChanged)
         {
@@ -1704,7 +1874,7 @@ bool Foam::fvMeshHexRefiner::writeObject
         cellSet protectedCells(mesh_, "protectedCells", nProtected_);
         forAll(protectedCell_, celli)
         {
-            if (protectedCell_.get(celli))
+            if (protectedCell_[celli])
             {
                 protectedCells.insert(celli);
             }
